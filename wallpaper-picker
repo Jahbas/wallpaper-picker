@@ -1,0 +1,437 @@
+#!/usr/bin/env python3
+import signal
+import subprocess
+import json
+import time
+from pathlib import Path
+
+import gi
+
+gi.require_version("Gtk", "3.0")
+gi.require_version("Gdk", "3.0")
+from gi.repository import Gdk, GdkPixbuf, GLib, Gtk, cairo
+
+
+WALLPAPER_DIR = Path.home() / "Pictures" / "Wallpapers"
+HYPRPAPER_CONF = Path.home() / ".config" / "hypr" / "hyprpaper.conf"
+MONITOR = "HDMI-A-1"
+VISIBLE_ITEMS = 3
+THUMB_WIDTH = 250
+THUMB_HEIGHT = 146
+CARD_PADDING = 8
+CARD_RADIUS = 16
+SPACING = 10
+SIDE_PADDING = 8
+TOP_PADDING = 8
+BOTTOM_PADDING = 4
+FADE_WIDTH = 18
+SURFACE = "rgba(17, 17, 27, 0.22)"
+EDGE_FADE = "rgba(17, 17, 27, 0.60)"
+DEBUG_LOG = Path.home() / ".cursor" / "debug-286037.log"
+DEBUG_SESSION_ID = "286037"
+
+
+def debug_log(hypothesis_id, location, message, data):
+    # region agent log
+    payload = {
+        "sessionId": DEBUG_SESSION_ID,
+        "runId": "regression",
+        "hypothesisId": hypothesis_id,
+        "location": location,
+        "message": message,
+        "data": data,
+        "timestamp": int(time.time() * 1000),
+    }
+    try:
+        with DEBUG_LOG.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(payload, separators=(",", ":")) + "\n")
+    except Exception:
+        pass
+    # endregion
+
+
+def list_wallpapers():
+    exts = {".jpg", ".jpeg", ".png", ".webp"}
+    files = [p for p in sorted(WALLPAPER_DIR.iterdir()) if p.is_file() and p.suffix.lower() in exts]
+    return files
+
+
+def load_thumbnail(path):
+    pixbuf = GdkPixbuf.Pixbuf.new_from_file_at_scale(str(path), THUMB_WIDTH, THUMB_HEIGHT, True)
+    return pixbuf
+
+
+class RoundedImage(Gtk.DrawingArea):
+    def __init__(self, pixbuf, radius):
+        super().__init__()
+        self.pixbuf = pixbuf
+        self.radius = radius
+        self.set_size_request(pixbuf.get_width(), pixbuf.get_height())
+        self.connect("draw", self.on_draw)
+
+    def on_draw(self, _widget, cr):
+        width = self.pixbuf.get_width()
+        height = self.pixbuf.get_height()
+        radius = min(self.radius, width / 2, height / 2)
+
+        cr.new_sub_path()
+        cr.arc(width - radius, radius, radius, -1.5708, 0.0)
+        cr.arc(width - radius, height - radius, radius, 0.0, 1.5708)
+        cr.arc(radius, height - radius, radius, 1.5708, 3.14159)
+        cr.arc(radius, radius, radius, 3.14159, 4.71239)
+        cr.close_path()
+        cr.clip()
+
+        Gdk.cairo_set_source_pixbuf(cr, self.pixbuf, 0, 0)
+        cr.paint()
+        return False
+
+
+def apply_wallpaper(path):
+    debug_log("H3", "wallpaper-picker:84", "apply_wallpaper_enter", {"path": str(path), "monitor": MONITOR})
+    HYPRPAPER_CONF.write_text(
+        "\n".join(
+            [
+                f"preload = {path}",
+                "wallpaper {",
+                f"    monitor = {MONITOR}",
+                f"    path = {path}",
+                "}",
+                "splash = false",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    debug_log("H4", "wallpaper-picker:94", "hyprpaper_conf_written", {"config": HYPRPAPER_CONF.read_text(encoding="utf-8")})
+
+    pkill_result = subprocess.run(["pkill", "-x", "hyprpaper"], check=False)
+    debug_log("H3", "wallpaper-picker:97", "pkill_hyprpaper", {"returncode": pkill_result.returncode})
+    proc = subprocess.Popen(
+        ["hyprpaper", "-c", str(HYPRPAPER_CONF)],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+    debug_log("H4", "wallpaper-picker:103", "hyprpaper_spawned", {"pid": proc.pid})
+
+
+class WallpaperPicker(Gtk.Window):
+    def __init__(self):
+        super().__init__(title="Wallpaper Picker")
+        self.wallpapers = list_wallpapers()
+        self.page_index = 0
+        self.page_box = None
+        self.thumbnail_cache = {}
+        self.thumbnail_requests = set()
+        self.preload_index = 0
+        self.outer = None
+        self.fade_left = None
+        self.fade_right = None
+
+        self.set_name("wallpaper-picker")
+        self.set_decorated(False)
+        self.set_resizable(False)
+        self.set_skip_taskbar_hint(True)
+        self.set_skip_pager_hint(True)
+        self.set_keep_above(True)
+        self.set_type_hint(Gdk.WindowTypeHint.DIALOG)
+        self.set_position(Gtk.WindowPosition.CENTER_ALWAYS)
+        self.set_border_width(0)
+        self.connect("key-press-event", self.on_key_press)
+        self.connect("focus-out-event", self.on_focus_out)
+        self.connect("scroll-event", self.on_scroll)
+        self.connect("destroy", Gtk.main_quit)
+
+        screen = self.get_screen()
+        visual = screen.get_rgba_visual()
+        if visual and screen.is_composited():
+            self.set_visual(visual)
+        self.set_app_paintable(True)
+
+        height = THUMB_HEIGHT + TOP_PADDING + BOTTOM_PADDING
+        width = self.page_width(VISIBLE_ITEMS)
+        self.set_default_size(width, height)
+        self.set_size_request(width, height)
+
+        outer = Gtk.Overlay()
+        outer.set_size_request(width, height)
+        outer.add_events(Gdk.EventMask.SCROLL_MASK | Gdk.EventMask.SMOOTH_SCROLL_MASK)
+        outer.connect("scroll-event", self.on_scroll)
+        self.outer = outer
+
+        panel = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=SPACING)
+        panel.set_name("wallpaper-panel")
+        panel.set_margin_top(TOP_PADDING)
+        panel.set_margin_bottom(BOTTOM_PADDING)
+        panel.set_margin_start(SIDE_PADDING)
+        panel.set_margin_end(SIDE_PADDING)
+        panel.set_halign(Gtk.Align.CENTER)
+        panel.set_valign(Gtk.Align.CENTER)
+        panel.set_size_request(width - (SIDE_PADDING * 2), THUMB_HEIGHT)
+        panel.add_events(Gdk.EventMask.SCROLL_MASK | Gdk.EventMask.SMOOTH_SCROLL_MASK)
+        panel.connect("scroll-event", self.on_scroll)
+        self.page_box = panel
+        outer.add(panel)
+
+        for attr_name, name, halign, valign, width_req, height_req in (
+            ("fade_left", "fade-left", Gtk.Align.START, Gtk.Align.FILL, FADE_WIDTH, -1),
+            ("fade_right", "fade-right", Gtk.Align.END, Gtk.Align.FILL, FADE_WIDTH, -1),
+        ):
+            fade = Gtk.Box()
+            fade.set_name(name)
+            fade.set_halign(halign)
+            fade.set_valign(valign)
+            fade.set_size_request(width_req, height_req)
+            fade.set_sensitive(False)
+            fade.add_events(Gdk.EventMask.SCROLL_MASK | Gdk.EventMask.SMOOTH_SCROLL_MASK)
+            fade.connect("scroll-event", self.on_scroll)
+            setattr(self, attr_name, fade)
+            outer.add_overlay(fade)
+
+        self.render_page()
+        self.add(outer)
+
+        self.apply_css()
+        GLib.idle_add(self.preload_all_thumbnails, priority=GLib.PRIORITY_DEFAULT_IDLE)
+
+    def page_width(self, item_count):
+        count = max(1, min(VISIBLE_ITEMS, item_count))
+        return (THUMB_WIDTH * count) + (SPACING * (count - 1)) + (SIDE_PADDING * 2)
+
+    def render_page(self):
+        for child in self.page_box.get_children():
+            self.page_box.remove(child)
+
+        start = self.page_index * VISIBLE_ITEMS
+        current = self.wallpapers[start:start + VISIBLE_ITEMS]
+        visible_count = len(current)
+
+        for wallpaper in current:
+            self.page_box.pack_start(self.build_item(wallpaper), False, False, 0)
+
+        page_width = self.page_width(visible_count)
+        total_height = THUMB_HEIGHT + TOP_PADDING + BOTTOM_PADDING
+        self.page_box.set_size_request(page_width - (SIDE_PADDING * 2), THUMB_HEIGHT)
+        self.outer.set_size_request(page_width, total_height)
+        self.fade_left.set_size_request(FADE_WIDTH, total_height)
+        self.fade_right.set_size_request(FADE_WIDTH, total_height)
+        self.set_size_request(page_width, total_height)
+        self.resize(page_width, total_height)
+        self.page_box.show_all()
+
+    def change_page(self, direction):
+        max_page = max(0, (len(self.wallpapers) - 1) // VISIBLE_ITEMS)
+        new_index = self.page_index + direction
+        new_index = max(0, min(max_page, new_index))
+
+        if new_index == self.page_index:
+            return
+
+        self.page_index = new_index
+        self.render_page()
+
+    def build_item(self, path):
+        button = Gtk.Button()
+        button.set_relief(Gtk.ReliefStyle.NONE)
+        button.set_can_focus(False)
+        button.connect("clicked", self.on_select, path)
+        button.connect("button-press-event", self.on_button_pointer, "button_press", path)
+        button.connect("button-release-event", self.on_button_pointer, "button_release", path)
+        button.set_name("wallpaper-button")
+        button.set_size_request(THUMB_WIDTH, THUMB_HEIGHT)
+        button.add_events(Gdk.EventMask.SCROLL_MASK | Gdk.EventMask.SMOOTH_SCROLL_MASK)
+        button.connect("scroll-event", self.on_scroll)
+        debug_log("H1", "wallpaper-picker:222", "build_item", {"path": str(path), "has_cached_thumbnail": path in self.thumbnail_cache})
+
+        pixbuf = self.thumbnail_cache.get(path)
+        if pixbuf is None:
+            button.add(self.build_placeholder())
+            self.queue_thumbnail_load(path, button)
+            return button
+
+        image = self.build_thumbnail_widget(pixbuf)
+        button.add(image)
+        return button
+
+    def build_placeholder(self):
+        placeholder = Gtk.Box()
+        placeholder.set_size_request(THUMB_WIDTH, THUMB_HEIGHT)
+        placeholder.add_events(Gdk.EventMask.BUTTON_PRESS_MASK | Gdk.EventMask.BUTTON_RELEASE_MASK)
+        placeholder.connect("button-press-event", self.on_child_pointer, "placeholder_press")
+        placeholder.connect("button-release-event", self.on_child_pointer, "placeholder_release")
+        return placeholder
+
+    def build_thumbnail_widget(self, pixbuf):
+        image = RoundedImage(pixbuf, CARD_RADIUS - 2)
+        image.add_events(
+            Gdk.EventMask.BUTTON_PRESS_MASK
+            | Gdk.EventMask.BUTTON_RELEASE_MASK
+            | Gdk.EventMask.SCROLL_MASK
+            | Gdk.EventMask.SMOOTH_SCROLL_MASK
+        )
+        image.connect("button-press-event", self.on_child_pointer, "image_press")
+        image.connect("button-release-event", self.on_child_pointer, "image_release")
+        image.add_events(Gdk.EventMask.SCROLL_MASK | Gdk.EventMask.SMOOTH_SCROLL_MASK)
+        image.connect("scroll-event", self.on_scroll)
+        return image
+
+    def queue_thumbnail_load(self, path, button):
+        if path not in self.thumbnail_requests:
+            self.thumbnail_requests.add(path)
+            GLib.idle_add(self.load_thumbnail_idle, path, priority=GLib.PRIORITY_DEFAULT_IDLE)
+
+        GLib.idle_add(self.attach_thumbnail_if_ready, path, button, priority=GLib.PRIORITY_DEFAULT_IDLE)
+
+    def queue_thumbnail_preload(self, path):
+        if path in self.thumbnail_cache or path in self.thumbnail_requests:
+            return
+        self.thumbnail_requests.add(path)
+        GLib.idle_add(self.load_thumbnail_idle, path, priority=GLib.PRIORITY_DEFAULT_IDLE)
+
+    def preload_all_thumbnails(self):
+        if self.preload_index >= len(self.wallpapers):
+            return False
+
+        path = self.wallpapers[self.preload_index]
+        self.preload_index += 1
+        self.queue_thumbnail_preload(path)
+        return True
+
+    def load_thumbnail_idle(self, path):
+        try:
+            self.thumbnail_cache[path] = load_thumbnail(path)
+        finally:
+            self.thumbnail_requests.discard(path)
+        return False
+
+    def attach_thumbnail_if_ready(self, path, button):
+        pixbuf = self.thumbnail_cache.get(path)
+        if pixbuf is None:
+            return path in self.thumbnail_requests
+
+        if button.get_parent() is None:
+            debug_log("H5", "wallpaper-picker:269", "thumbnail_ready_button_detached", {"path": str(path)})
+            return False
+
+        child = button.get_child()
+        if child is not None:
+            button.remove(child)
+        button.add(self.build_thumbnail_widget(pixbuf))
+        button.show_all()
+        debug_log("H5", "wallpaper-picker:276", "thumbnail_attached", {"path": str(path), "button_visible": button.get_visible()})
+        return False
+
+    def apply_css(self):
+        css = f"""
+        window#wallpaper-picker {{
+            background: transparent;
+        }}
+        #wallpaper-panel {{
+            background: {SURFACE};
+            border-radius: 16px;
+            border: none;
+            box-shadow: none;
+        }}
+        #wallpaper-panel,
+        #wallpaper-button {{
+            transition: 80ms ease;
+        }}
+        #fade-left {{
+            background-image: linear-gradient(to right, {EDGE_FADE}, rgba(17, 17, 27, 0.0));
+        }}
+        #fade-right {{
+            background-image: linear-gradient(to left, {EDGE_FADE}, rgba(17, 17, 27, 0.0));
+        }}
+        button {{
+            background: transparent;
+            border: none;
+            box-shadow: none;
+            padding: 0;
+            outline: none;
+        }}
+        #wallpaper-button {{
+            background: transparent;
+            border: none;
+            box-shadow: none;
+            padding: 0;
+        }}
+        button:focus,
+        button:active,
+        button:hover,
+        #wallpaper-button:focus,
+        #wallpaper-button:active,
+        #wallpaper-button:hover {{
+            outline: none;
+            box-shadow: none;
+            border: none;
+            background: transparent;
+        }}
+        """
+        provider = Gtk.CssProvider()
+        provider.load_from_data(css.encode("utf-8"))
+        Gtk.StyleContext.add_provider_for_screen(
+            Gdk.Screen.get_default(),
+            provider,
+            Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION,
+        )
+
+    def on_select(self, _button, path):
+        debug_log("H2", "wallpaper-picker:334", "on_select", {"path": str(path)})
+        apply_wallpaper(path)
+        self.close()
+
+    def on_button_pointer(self, _button, event, source, path):
+        debug_log("H1", "wallpaper-picker:339", "button_pointer", {"source": source, "path": str(path), "button": getattr(event, "button", None), "type": str(event.type)})
+        return False
+
+    def on_child_pointer(self, _widget, event, source):
+        debug_log("H7", "wallpaper-picker:343", "child_pointer", {"source": source, "button": getattr(event, "button", None), "type": str(event.type)})
+        return False
+
+    def on_key_press(self, _widget, event):
+        if event.keyval in (Gdk.KEY_Escape, Gdk.KEY_q):
+            self.close()
+
+    def on_scroll(self, widget, event):
+        if event.direction == Gdk.ScrollDirection.UP:
+            self.change_page(-1)
+            return True
+        if event.direction == Gdk.ScrollDirection.DOWN:
+            self.change_page(1)
+            return True
+        if event.direction == Gdk.ScrollDirection.LEFT:
+            self.change_page(-1)
+            return True
+        if event.direction == Gdk.ScrollDirection.RIGHT:
+            self.change_page(1)
+            return True
+        if event.direction == Gdk.ScrollDirection.SMOOTH:
+            _, delta_x, delta_y = event.get_scroll_deltas()
+            delta = delta_x if abs(delta_x) > abs(delta_y) else delta_y
+            if delta > 0.1:
+                self.change_page(1)
+            elif delta < -0.1:
+                self.change_page(-1)
+            return True
+        return False
+
+    def on_focus_out(self, *_args):
+        return False
+
+
+def main():
+    if not WALLPAPER_DIR.exists():
+        raise SystemExit(f"Wallpaper folder not found: {WALLPAPER_DIR}")
+
+    if not list_wallpapers():
+        raise SystemExit(f"No wallpapers found in: {WALLPAPER_DIR}")
+
+    signal.signal(signal.SIGINT, signal.SIG_DFL)
+    window = WallpaperPicker()
+    window.show_all()
+    Gtk.main()
+
+
+if __name__ == "__main__":
+    main()
